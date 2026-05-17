@@ -1,0 +1,6 @@
+Method,Scope,Why used,Best for
+Integrated Gradients,Waveform input,Faithful gradient-based attribution for differentiable ECG models,Per-beat saliency and lead-wise temporal relevance
+Grad-CAM,Last convolutional feature map,Highlights discriminative regions in CNN-based ECG experts,Morphology localization around P/QRS/T regions
+Occlusion sensitivity,Input perturbation,Sanity-checks whether masking a region changes the prediction,Faithfulness validation
+SHAP / WindowSHAP,Handcrafted features or time windows,Additive contribution scores for non-linear feature-based experts,RR and morphology feature interpretation
+Fusion weight analysis,Model-level expert combination,Explains which expert the final decision relied on,Late-fusion V11 interpretation
