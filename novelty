@@ -1,0 +1,56 @@
+Your Actual Novelty — Honest Assessment
+1. The Core Architectural Contribution: Cross-Attention Morpho-Rhythm Fusion within a beat-level CNN
+The CrossAttentionFusion module lets the RR-interval rhythm branch query into the morphology (waveform) branch rather than simply concatenating them. This is not just "multi-modal fusion" — the attention weights are per-head and fold-specific, meaning rhythm context selectively gates morphological features at inference time.
+Claim you can make: A lightweight cross-attention mechanism for intra-beat morphology–rhythm interaction, as opposed to late concatenation or simple weighted averaging used in most ECG beat classifiers.
+Caveat: This is meaningful but not entirely unprecedented. Some transformer-based ECG papers (e.g., on 12-lead classification) use cross-modal attention. You need to differentiate explicitly — your contribution is doing this at the beat segment level with 12-lead 1D-CNN features rather than at the record/window level.
+
+2. Patient-Aware Calibration-Time Fusion with Adaptive Strategy Selection
+This is your strongest and most defensible novelty. The choose_fusion function does something most ensemble papers do not: it evaluates multiple fusion strategies on a held-out calibration set at test time (per fold) and selects the best-performing one before applying it to the test set. Specifically:
+
+Three strategies compete: per-expert passthrough, weighted grid search, and a meta-logistic-regressor trained on stacked expert probabilities + entropy + margin features.
+The selection is fold-specific (folds 1–2 used meta_logreg, folds 3–5 used weighted_grid) — meaning the fusion strategy itself adapts.
+Critically, splits are record-level (patient-aware), not beat-level, which prevents the patient-overlap data leakage that invalidates a large fraction of published ECG work.
+
+Claim you can make: A calibration-time adaptive fusion framework where the fusion strategy (meta-learner vs. weighted combination) is selected per deployment context using a held-out calibration set, under strict patient-disjoint cross-validation.
+Caveat: The performance gain is real but modest — ΔF1 = +0.0070, ΔAUROC = +0.0012 over V9 alone. You cannot claim dramatic performance improvement. Frame the contribution as the framework and its methodological correctness, not raw numbers.
+
+3. Tri-Expert Heterogeneous Ensemble: Deep Morphology × Rhythm × Handcrafted Physiology
+You fuse three epistemically different expert types:
+
+V8 (deep CNN, 256-channel) — learnt morphology
+V9 (deeper CNN with TTA, 384-channel) — larger capacity learnt morphology
+XGBoost on 174 handcrafted features — domain-engineered physiology
+
+The meta-features built for fusion include per-expert entropy and confidence margin, not just raw probabilities. This gives the meta-learner a calibration signal beyond class scores.
+Claim you can make: Fusion of heterogeneous inductive biases — deep-learnt spatial features, test-time augmented predictions, and clinical feature engineering — under a unified calibration-time selection framework.
+Caveat: V8 and V9 are both residual CNNs on the same input. The "heterogeneity" is weaker than if you had e.g. a transformer vs. CNN vs. signal-processing pipeline. Be honest that V8/V9 are architectural variants rather than truly independent inductive biases.
+
+4. Five-Layer XAI Stack Applied Across the Ensemble
+You apply five interpretability methods at different levels of the model simultaneously:
+
+IG (input-level, waveform saliency, faithfulness via completeness axiom)
+GradCAM (last conv block, temporal heatmap)
+SHAP GradientExplainer (RR features, per-class Shapley values)
+Occlusion sensitivity (faithfulness validation of IG)
+Cross-attention weight extraction (rhythm→morphology influence)
+
+Then separately, three fusion-level XAI plots: which strategy won per fold, per-fold gain over V9, and expert weight distribution.
+Claim you can make: A multi-granularity interpretability framework that spans input attribution, intermediate representations, feature importance, and ensemble decision audit — applied cohesively to a clinical ECG classification system.
+Caveat: Each individual method (IG, GradCAM, SHAP) is off-the-shelf. The novelty is in the combination and layering, particularly the fusion-level audit plots (V11-A/B/C), which are genuinely your own. Don't claim novelty for the XAI methods themselves.
+
+What You Should NOT Claim as Novel
+
+The dual-branch architecture (CNN + RR encoder) exists in prior work.
+Beat segmentation + 12-lead classification is a well-studied setting.
+3-class cardiac grouping (Normal / Structural / Arrhythmia) is a standard framing.
+Patient-aware splits are methodologically correct but not a contribution by themselves — they're just doing it right.
+
+
+Summary for Paper Drafting
+Your novelty sits in three places, in descending defensibility:
+
+Calibration-time adaptive fusion with patient-aware splits — the most publishable claim.
+Cross-attention morpho-rhythm interaction within beat-level CNNs — meaningful if properly positioned against prior work.
+Multi-granularity XAI covering both model internals and ensemble decision auditing — a practical contribution, not a methods contribution.
+
+The system result (F1 = 0.8818, AUROC = 0.9634) is strong, but the gain margin over V9 alone is too small to anchor the paper. Anchor it on the framework, not the numbers.
