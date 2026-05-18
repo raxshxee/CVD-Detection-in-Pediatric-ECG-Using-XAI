@@ -1,0 +1,17 @@
+---------------------------------------------------------------------------
+FileNotFoundError                         Traceback (most recent call last)
+Cell In[10], line 27
+     25 all_y_true.append(np.load(d / "test_labels.npy"))
+     26 all_fusion.append(np.load(d / "fusion_test_probs.npy"))
+---> 27 all_v8.append(np.load(d / "v8_test_probs.npy"))
+     28 all_v9.append(np.load(d / "v9_test_probs.npy"))
+     29 all_xgb.append(np.load(d / "xgb_test_probs.npy"))
+
+File ~\AppData\Local\Programs\Python\Python312\Lib\site-packages\numpy\lib\npyio.py:427, in load(file, mmap_mode, allow_pickle, fix_imports, encoding, max_header_size)
+    425     own_fid = False
+    426 else:
+--> 427     fid = stack.enter_context(open(os_fspath(file), "rb"))
+    428     own_fid = True
+    430 # Code to distinguish from NumPy binary files and pickles.
+
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\Admin\\Desktop\\Projects\\8th Sem\\Codex\\outputs\\v11_triexpert_fusion\\fold_1\\v8_test_probs.npy'
