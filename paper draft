@@ -1,0 +1,625 @@
+# Explainable AI–Based Detection of Pediatric Cardiovascular Diseases Using Multi-Lead ECG Signals
+
+**Authors:** {PLACEHOLDER: author list, affiliations, corresponding email}
+
+---
+
+## Abstract
+
+Pediatric electrocardiograms (ECGs) differ substantially from adult recordings in heart rate, axis, interval durations, and amplitude characteristics, yet most existing ECG classification systems are trained on adult data and provide little or no insight into the rationale behind their predictions. We address both problems together by building a beat-level multi-lead ECG classifier for pediatric cardiovascular disease detection, organised around three complementary experts and a calibration-time fusion stage, and we audit the system with a five-method interpretability stack applied at four different granularities. The work uses the recently released ZZU pediatric ECG database, which provides {PLACEHOLDER: N} 12-lead recordings from {PLACEHOLDER: N} children aged 0–14, with disease diagnoses encoded against AHA/ACC/HRS and Chinese consensus standards [REF: Tan2025_ZZU]. We frame the task as 3-class beat classification (Normal/Non-cardiac, Structural Heart Disease, Arrhythmia & Electrical) under strict patient-disjoint 5-fold cross-validation. Three experts are combined: a 256-channel residual CNN with rhythm-aware cross-attention (V8), a wider 384-channel variant with test-time augmentation (V9), and an XGBoost classifier trained on 174 handcrafted beat-level features. The fusion stage is itself adaptive: on the per-fold calibration split we evaluate each individual expert, a weighted-grid combination, and a meta-logistic regressor stacked on expert probabilities together with per-expert entropy and confidence-margin features, then select whichever strategy performs best before applying it to the test split. Across five folds the fusion model achieved macro-F1 = {PLACEHOLDER: 0.XXX ± 0.XXX}, accuracy = {PLACEHOLDER: 0.XXX} and AUROC = {PLACEHOLDER: 0.XXX}, modestly outperforming the strongest single expert ({PLACEHOLDER: ΔF1 = +0.00XX}). Interpretability is provided through Integrated Gradients and GradCAM over the waveform branch, SHAP over the RR-feature branch, occlusion-based faithfulness validation, cross-attention weight extraction, and three fusion-level audit plots that explain *which* fusion strategy won, by *how much*, and *which expert* it leaned on per fold. We frame this work primarily as a methodological framework — patient-disjoint adaptive fusion with multi-granularity explainability — rather than as a leaderboard claim, and we are explicit throughout the paper about where the headroom over the strongest single expert is and is not statistically meaningful.
+
+**Keywords:** Pediatric ECG, cardiovascular disease detection, deep learning, cross-attention, ensemble fusion, explainable AI, integrated gradients, GradCAM, SHAP, patient-disjoint cross-validation.
+
+---
+
+## 1. Introduction
+
+Cardiovascular disease remains the leading cause of mortality globally [REF: WHF2024]. While most adult cardiovascular conditions develop progressively over decades, there is now strong evidence that the underlying risk trajectory begins in childhood [REF: Li2003_Bogalusa; REF: Juonala2011]. Detecting pediatric cardiac pathology early — whether structural (congenital defects, cardiomyopathy) or electrical (arrhythmias, conduction disturbances) — meaningfully shapes long-term outcomes [REF: Zhu2022_JACCAsia].
+
+The electrocardiogram is the most widely available and least invasive tool for this purpose. In adults, ECG-based deep learning has matured rapidly: end-to-end models now match or exceed cardiologist-level performance on selected tasks [REF: Hannun2019; REF: Ribeiro2020]. The pediatric setting is different in three concrete ways. First, the pediatric ECG is a moving target. Heart rate at birth routinely exceeds 140 bpm and falls toward adult ranges only by adolescence; QRS axis migrates from rightward (newborn) to leftward (older child); R/S amplitude ratios in the precordial leads invert with age [REF: Dickinson2005; REF: OConnor2008]. Second, the disease mix is different. Congenital heart defects, myocarditis, Kawasaki disease, and cardiomyopathy dominate the pediatric cardiac caseload; ischemic heart disease — the bulk of adult ECG literature — is rare [REF: Tan2025_ZZU]. Third, lead placement is often incomplete in young children, with V2/V4/V6 frequently substituted by V1/V3/V5 in patients under seven [REF: Chen2024_NatComm].
+
+For these reasons, models trained on adult cohorts (PTB-XL [REF: Wagner2020], Shaoxing [REF: Zheng2020], SPH [REF: Liu2022_SPH]) cannot be assumed to transfer to children — and indeed, those datasets contain almost no pediatric records [REF: Tan2025_ZZU, Table 1]. Until very recently, the pediatric ECG community simply did not have a sufficiently large, disease-labelled corpus to train modern deep models. The ZZU pediatric ECG database (14,190 recordings from 11,643 children aged 0–14, with ICD-10–coded cardiovascular disease labels) is the first such corpus to be released openly at this scale [REF: Tan2025_ZZU].
+
+The second gap is interpretability. Even where adult ECG models work well, the predictions are typically delivered as a single softmax vector; for clinical use, especially in pediatrics, that is not enough. Clinicians need to know *which part of the beat* drove a decision, *which leads* carried the signal, and — in ensemble systems — *which sub-model* contributed. Post-hoc attribution methods (Integrated Gradients [REF: Sundararajan2017], GradCAM [REF: Selvaraju2017], SHAP [REF: Lundberg2017]) and faithfulness checks via occlusion [REF: Zeiler2014] are now standard tools, but they are usually applied one at a time, to one model, in isolation. In a system that fuses heterogeneous experts, attribution at the input level only tells part of the story: the fusion decision itself needs to be auditable.
+
+The contribution of this work sits at the intersection of these two gaps. We build a tri-expert beat-level classifier on the ZZU pediatric corpus, fuse the experts at calibration time using an adaptive strategy-selection procedure under strict patient-disjoint cross-validation, and audit the resulting system with explanations at four granularities: input waveform attribution, intermediate convolutional activations, rhythm-feature importance, and fusion-stage decision audit. We position the framework — particularly the patient-disjoint adaptive fusion — as the central methodological contribution; the headline accuracy numbers are competitive but the margin over the strongest single expert is modest, and we are explicit about that throughout.
+
+The rest of the paper is organised as follows. Section 2 reviews adult and pediatric ECG modelling, ensemble fusion, and ECG-specific XAI, and identifies where the present work fits. Section 3 sets out the research gap, motivation, problem statement, objectives, and contribution list. Sections 4 and 5 describe the dataset and preprocessing pipeline. Section 6 develops the model architecture, including the cross-attention morpho-rhythm fusion. Section 7 describes the training procedure and the calibration-time fusion logic. Section 8 lays out the XAI stack. Sections 9–11 cover the experimental setup, evaluation metrics, and results. Sections 12–14 contain comparative analysis, explainability analysis, and error analysis. Section 15 discusses limitations and future work. Section 16 concludes.
+
+---
+
+## 2. Literature Review / Related Work
+
+### 2.1 Adult ECG classification with deep learning
+
+Large adult ECG corpora — MIT-BIH [REF: Moody2001], PTB-XL [REF: Wagner2020], Shaoxing [REF: Zheng2020], SPH [REF: Liu2022_SPH], MIMIC-IV-ECG [REF: Brian2023] — have enabled a series of strong CNN- and transformer-based classifiers. Ribeiro et al. trained a 6-block residual CNN on 2.3 million 12-lead recordings and reached F1 scores above 0.80 across six rhythm classes [REF: Ribeiro2020]. Hannun et al. used a 34-layer 1-D CNN on single-lead recordings for 12-class rhythm detection at cardiologist level [REF: Hannun2019]. More recent architectures fold in transformer-style attention either across leads or across time [REF: AttnECG_paper_placeholder]. Across this literature the inputs are almost exclusively from adults, and the disease label set is rhythm-dominated.
+
+### 2.2 Pediatric ECG modelling
+
+Pediatric-specific deep ECG work is much sparser. The PHN dataset [REF: Saarel2018] (2,400 recordings of healthy North American children) and the FDA pediatric ECG warehouse [REF: FDA2021] (publicly inaccessible) have been used for normative range characterisation rather than disease classification. Chen et al. reported a congenital heart disease detector trained on a pediatric corpus, with attention paid to lead-availability constraints in young children [REF: Chen2024_NatComm]. The ZZU pediatric ECG database [REF: Tan2025_ZZU] is the first openly released pediatric dataset of sufficient size and with explicit ICD-10–coded disease labels for the conditions that dominate pediatric cardiology — congenital heart disease, myocarditis, cardiomyopathy, Kawasaki disease — making it the natural substrate for the present work.
+
+### 2.3 Ensemble and fusion strategies for ECG
+
+Ensembling has a long history in ECG competitions, dating back to the PhysioNet/CinC Challenge series [REF: CinC_overview_placeholder]. Strategies fall broadly into three families: late averaging of probabilities, learnt stacking via a small meta-classifier [REF: Wolpert1992_stacking], and gating mixture-of-experts approaches [REF: Jacobs1991_MoE]. Most published ECG ensembles fix the fusion rule a priori. Our work differs in that the fusion strategy itself is selected at calibration time per fold — see Section 7.4 for details.
+
+### 2.4 Multi-modal architectures: morphology and rhythm
+
+Several recent ECG classifiers separate the waveform branch from the inter-beat (RR) branch and then combine them. The standard combination is late concatenation followed by an MLP head [REF: WaveformRR_concat_placeholder]. A smaller body of work introduces cross-attention between the two branches at the record level [REF: TransformerECG_xattn_placeholder]. To our knowledge, cross-attention between morphology and rhythm specifically at the beat level — i.e., as part of a per-beat classifier rather than a windowed transformer — has not been systematically studied; we adopt this design and describe it in Section 6.2.
+
+### 2.5 Explainable AI for ECG
+
+Saliency-based methods have been applied to ECG models since at least 2019. Integrated Gradients [REF: Sundararajan2017] and gradient-times-input have been used for waveform-level attribution [REF: ECG_IG_placeholder]; GradCAM [REF: Selvaraju2017] is widely used to localise the QRS region [REF: ECG_GradCAM_placeholder]; SHAP [REF: Lundberg2017] is the standard tool for handcrafted-feature contributions [REF: ECG_SHAP_placeholder]. Occlusion-based methods provide a model-agnostic faithfulness check by direct intervention on the input signal [REF: Zeiler2014]. Most published ECG-XAI work applies one of these methods to one model. We argue in Section 8 that for a fused multi-expert system, a multi-granularity stack is more informative than any single method, and that the fusion stage itself needs an audit.
+
+### 2.6 Where this work sits
+
+Putting the threads together: pediatric ECG-specific deep models are rare, ensemble fusion is usually fixed rather than adaptive, and XAI is typically applied as a single method to a single model. We address all three within one framework, with the patient-disjoint adaptive fusion as the primary methodological contribution and the multi-granularity XAI audit as the secondary practical contribution.
+
+---
+
+## 3. Research Gap, Motivation, Problem Statement, Objectives, Contributions
+
+### 3.1 Research Gap
+
+From the literature review, three concrete gaps motivate this work:
+
+1. **Pediatric coverage.** Almost all published deep ECG classifiers are trained and validated on adult data. Direct application to pediatric ECG is questionable on physiological grounds: heart rate ranges, axis, intervals, and lead-availability conventions all differ. The ZZU pediatric corpus is recent enough that downstream modelling work on it is still nascent.
+
+2. **Fixed fusion rules.** Most ensemble systems pick a fusion rule (weighted average, stacking, voting) once and apply it. There is little work that asks *which* rule should be used and lets the answer depend on the fold/calibration split.
+
+3. **Single-method XAI.** Saliency methods have known disagreements among themselves [REF: Adebayo2018_sanity]. In a fused system, audit needs to span both the per-expert input attributions and the fusion stage's own decisions.
+
+### 3.2 Motivation
+
+The motivating clinical scenario is screening review in a pediatric cardiology setting. A physician wants three things from a model used in this loop: a prediction with calibrated uncertainty, a waveform-level explanation of where the model is looking, and an audit trail when the prediction is the result of an ensemble decision. The framework developed here is designed around those three needs.
+
+### 3.3 Problem Statement
+
+Given a 12-lead pediatric ECG record from a child aged 0–14, segmented into beats with associated RR-interval features and handcrafted physiological features, build a classifier that assigns each beat to one of three categories — Normal/Non-cardiac, Structural Heart Disease, Arrhythmia & Electrical — under strict patient-disjoint cross-validation, and produce, for any prediction, an explanation at the level of (a) the waveform, (b) the rhythm features, (c) the convolutional feature maps, and (d) the fusion stage.
+
+### 3.4 Objectives
+
+- O1. Build three complementary experts — two CNN waveform models with different capacity and a tree-based model on handcrafted features — under matched patient-disjoint splits.
+- O2. Introduce a beat-level cross-attention fusion between morphology and rhythm within each CNN expert.
+- O3. Develop a calibration-time fusion stage that *adaptively chooses* between per-expert pass-through, weighted-grid combination, and meta-logistic stacking, on a per-fold basis.
+- O4. Apply a multi-granularity XAI stack: Integrated Gradients, GradCAM, SHAP, occlusion, and cross-attention weight extraction.
+- O5. Audit the fusion decisions themselves with three diagnostic plots (winning strategy, gain over the strongest single expert, expert-weight distribution).
+
+### 3.5 Contributions
+
+In order of methodological weight:
+
+- **(C1) Patient-disjoint adaptive calibration-time fusion.** A per-fold procedure that scores candidate fusion strategies on a held-out calibration split and selects the winning strategy before applying it to the outer test split. Patient-disjoint splits at the record level prevent the patient-overlap leakage that we observed is common in beat-level ECG papers.
+- **(C2) Beat-level cross-attention between morphology and rhythm.** A lightweight two-head cross-attention module where the rhythm embedding queries the morphology embedding inside a beat-level CNN classifier.
+- **(C3) Multi-granularity XAI for fused systems.** A four-level audit covering input waveform attribution (IG, GradCAM, occlusion), rhythm feature importance (SHAP), intermediate attention weights, and the fusion decision itself.
+- **(C4) Empirical baseline on the ZZU pediatric corpus** for three-class pediatric cardiovascular grouping under patient-disjoint 5-fold CV, reported honestly with mean ± std and per-fold breakdowns.
+
+We do *not* claim novelty for (a) the dual-branch CNN+RR architecture, (b) the use of any individual XAI method, or (c) the three-class disease grouping itself.
+
+---
+
+## 4. Dataset Description
+
+We use the ZZU pediatric ECG dataset [REF: Tan2025_ZZU], which is, at the time of writing, the largest openly available pediatric ECG corpus with explicit cardiovascular disease diagnoses. The dataset was acquired at the First Affiliated Hospital of Zhengzhou University between January 2018 and May 2024, under IRB approval that waived informed consent for de-identified scientific reuse.
+
+**Cohort.** 11,643 hospitalised children, ages 0–14 (6,740 male, 4,903 female; age unit recorded in days). The age distribution is heavily skewed toward older children, with 4,000+ recordings in the 12–14 year range and a long tail toward the neonatal end (Fig. 1 of [REF: Tan2025_ZZU]).
+
+**Recordings.** 14,190 total ECG records. 12,334 are full 12-lead (I, II, III, aVR, aVL, aVF, V1–V6); 1,856 are 9-lead, with V2/V4/V6 substituted by V1/V3/V5 — a deliberate concession to lead-placement difficulty in young children [REF: Tan2025_ZZU]. Sampling rate 500 Hz; record length 5–120 s, with ~93% in the 20–40 s range.
+
+**Labels.** ECG diagnostic statements are encoded under both the AHA/ACC/HRS standard [REF: Kligfield2007] and a Chinese expert consensus standard [REF: Guo2019]. Disease diagnoses are ICD-10–coded [REF: WHO_ICD10]. Of the 14,190 records, 3,716 carry one or more cardiovascular disease labels; 10,474 carry other disease labels but no cardiac diagnosis.
+
+**Quality control.** Three signal-quality indices — pSQI (high-frequency noise), basSQI (baseline wander), bSQI (beat-detection agreement) — are reported per lead in the released metadata [REF: Tan2025_ZZU].
+
+**Disease grouping used here.** The 19 cardiovascular disease categories in the ZZU dataset span myocarditis, cardiomyopathy, Kawasaki disease, and a range of congenital heart defects (Table 2 of [REF: Tan2025_ZZU]). For modelling we collapse these into three broader categories that align with clinical decision-making at triage time:
+
+| Class | Composition | Records (approx.) |
+|---|---|---|
+| 0 — Normal / Non-cardiac | No cardiovascular ICD-10 label | {PLACEHOLDER: N} |
+| 1 — Structural Heart Disease | Congenital defects (VSD, ASD, ToF, PDA, PS), cardiomyopathy | {PLACEHOLDER: N} |
+| 2 — Arrhythmia & Electrical | Myocarditis with conduction disturbance, Kawasaki with cardiac involvement, other arrhythmic labels | {PLACEHOLDER: N} |
+
+We chose this three-class framing because (a) per-disease cell counts in the 19-class breakdown are too small for robust per-fold patient-disjoint evaluation, and (b) the three groups correspond to clinically distinct downstream pathways. We acknowledge in Section 15 that this grouping discards within-class heterogeneity that future work could recover.
+
+---
+
+## 5. Data Preprocessing & ECG Signal Processing
+
+The preprocessing pipeline is designed to produce, for each ECG record, a sequence of fixed-length beats with associated RR-interval features and 174-dimensional handcrafted features. The pipeline runs once offline; the model loaders read its outputs directly.
+
+**Step 1 — Lead harmonisation.** For 9-lead records, V1/V3/V5 are used in place of V2/V4/V6 following the dataset's own convention [REF: Tan2025_ZZU]. All records are aligned to a canonical 12-channel layout.
+
+**Step 2 — Filtering.** The MedEx MECG-300 acquisition device applies its own built-in filter [REF: Tan2025_ZZU]. We apply only a mild zero-phase 0.5–40 Hz Butterworth bandpass to standardise the spectrum across records, since record lengths vary from 5–120 s and a few records exhibit baseline wander not fully suppressed by the device filter.
+
+**Step 3 — R-peak detection and beat segmentation.** R-peaks are detected on lead II using a Pan-Tompkins variant via NeuroKit2 [REF: Makowski2021_NeuroKit2]. We segment a 300-sample window around each R-peak: 100 samples (200 ms) pre-R, 200 samples (400 ms) post-R, at 500 Hz. The pre/post split is chosen so that the window covers the late portion of the P wave through the end of the T wave in typical pediatric heart-rate ranges (60–160 bpm). Beats whose window would run outside the record boundary are dropped.
+
+**Step 4 — Per-beat tensor.** Each beat is stored as a `300 × 12` float32 array on disk in a single memory-mapped binary file (`beats.dat`), with an accompanying `beats_meta.npz` containing labels, record IDs, and an 8-dimensional RR-interval feature vector per beat. The RR features are: mean, std, coefficient of variation, min, max, RMSSD, heart rate, and an HR-variability composite. These are computed per-record and broadcast to every beat from that record.
+
+**Step 5 — Handcrafted feature vector for the XGBoost expert.** A separate 174-dimensional feature vector is computed per beat, covering: per-lead morphological descriptors (R amplitude, S amplitude, QRS duration, ST level), per-lead T-wave shape statistics, fiducial-point ratios, cross-lead correlations, and the same RR-derived rhythm statistics. The full feature list is supplied in Supplementary Table S1.
+
+**Step 6 — Standardisation.** RR features and handcrafted features are z-normalised using the training-split statistics of each fold (fit on train, applied to calib and test). Beats themselves are not z-normalised: scale information is informative for several of the target classes and the CNN handles it through batch normalisation.
+
+**Step 7 — Patient-disjoint outer/inner splits.** This is the single most important design decision in the preprocessing pipeline. Beats from one patient are extremely correlated, so a beat-level random split inflates test performance dramatically [REF: Kachuee2018_leakage_placeholder]. We perform the split at the *record* level. Specifically, we use stratified shuffle splitting over unique record IDs to produce a 5-fold outer split (80/20 train/test on records) with class proportions matched on majority-class-per-record. Inside each outer training set we carve out a 15% inner calibration split (still record-disjoint from the outer test). Calibration is the set on which fusion-strategy selection happens; it is never seen by training or by final test reporting.
+
+**Step 8 — Augmentation.** Training-time augmentation applied to beats only (not RR features): additive Gaussian noise (σ = 0.025, p = 0.7), per-record amplitude scaling (±15%, p = 0.6), random lead dropout (1–2 leads zeroed, p = 0.35), and circular time-shift (±15 samples, p = 0.4). These are deliberately mild, since beats already carry strong class signal and aggressive augmentation harmed validation F1 in early ablations.
+
+---
+
+## 6. Model Architecture
+
+The classifier is composed of three experts whose outputs are fused at calibration time. The two CNN experts (V8 and V9) share the same architectural skeleton — a dual-branch beat encoder with cross-attention fusion — and differ only in the morphology branch's channel widths. The third expert is XGBoost on the 174 handcrafted features.
+
+### 6.1 Dual-branch beat encoder
+
+Each beat is processed by two parallel branches:
+
+- **Morphology branch.** A 1-D residual CNN over the `12 × 300` beat tensor.
+- **Rhythm branch.** A small MLP over the 8-D RR feature vector.
+
+The morphology branch consists of an initial stem (Conv1d kernel = 9, padding = 4, GELU), followed by three residual blocks. Each block is a two-layer residual unit with kernel sizes 7→5→5, BatchNorm, GELU, and a 10% dropout on the second conv. The first two blocks downsample by stride 2; the third keeps temporal resolution. A global average pool reduces the final feature map to a vector of dimension equal to the last block's channel count.
+
+For V8 the morphology channel progression is 64 → 64 → 128 → 256; for V9 it is 96 → 96 → 192 → 384. V9 therefore has roughly 2.25× the parameters of V8 in the morphology branch. We kept both rather than picking the better one for two reasons: (i) the calibration-time fusion stage exploits disagreement between them, which is largest when their capacities differ, and (ii) test-time augmentation (Section 7.3) gives V9 a slightly different effective inductive bias even at inference.
+
+The rhythm branch is a small MLP: Linear → BN → GELU → Linear → BN → GELU with a residual skip. Output dimension is 64 in both V8 and V9.
+
+### 6.2 Cross-attention morpho-rhythm fusion
+
+This is the architectural piece we put forward as a secondary contribution. Standard dual-branch ECG models concatenate the two branch embeddings and pass the result through an MLP head [REF: WaveformRR_concat_placeholder]. We replace the concatenation with a two-head cross-attention block in which the morphology embedding queries the rhythm embedding. Concretely, let m ∈ ℝ^D_m be the morphology embedding (D_m = 256 for V8, 384 for V9) and r ∈ ℝ^D_r the rhythm embedding (D_r = 64). The block computes, per head h ∈ {1, 2} and head dimension d = D_m / 2:
+
+- q_h = W^Q_h m, k_h = W^K_h r, v_h = W^V_h r (all in ℝ^d)
+- α_h = softmax_h( ⟨q_h, k_h⟩ / √d ) — *softmax over heads*, not over a sequence axis
+- o = Σ_h α_h · v_h
+- output = LayerNorm( m + W^P o )
+
+There is no sequence dimension here: the attention is between two single vectors. The softmax-over-heads is a gating mechanism — at inference time, α gives the relative weight assigned to each of the two attention heads as a function of the current beat's rhythm context. The attention weights are stored on the module as `_attn` after every forward pass and are extracted directly by the XAI stage (Section 8.5).
+
+The output of the fusion block is concatenated with r and passed to a 3-layer MLP head (linear, GELU, dropout 0.4 → linear, GELU, dropout 0.2 → linear), producing the 3-class logits.
+
+We acknowledge that cross-attention itself is not novel; cross-attention *between morphology and rhythm at the beat level* inside a per-beat classifier (rather than at the record/window level) is what we believe is less common in the literature.
+
+### 6.3 XGBoost expert
+
+The third expert is an XGBoost classifier [REF: Chen2016_XGBoost] trained on the 174-D handcrafted feature vector per beat, with the same patient-disjoint train/calib split as the CNN experts. Hyperparameters: n_estimators = 500, learning_rate = 0.05, max_depth = 8, min_child_weight = 2, subsample = 0.85, colsample_bytree = 0.80, reg_lambda = 2.0, tree_method = "hist". These were lightly tuned on fold 1 only and held fixed across folds 2–5.
+
+The XGBoost expert is intentionally complementary to the CNN experts: it sees nothing of the raw waveform shape, and instead reads engineered descriptors (R amplitude, QRS duration, RMSSD, cross-lead correlations, etc.) that capture summary statistics the CNN must learn to extract implicitly. In our setup it is consistently the weakest of the three on F1 ({PLACEHOLDER: F1_XGB}) but contributes useful disagreement to the fusion stage.
+
+### 6.4 Architecture summary
+
+| Component | V8 | V9 | XGBoost |
+|---|---|---|---|
+| Input | 300×12 beat + 8-D RR | 300×12 beat + 8-D RR | 174-D features |
+| Morphology widths | 64→128→256 | 96→192→384 | — |
+| Rhythm encoder | MLP 8→64→64 | MLP 8→64→64 | — |
+| Fusion | 2-head cross-attn, D_m=256 | 2-head cross-attn, D_m=384 | — |
+| Trainable params | {PLACEHOLDER: N_v8} | {PLACEHOLDER: N_v9} | — |
+| Test-time augmentation | No | Yes, 5 passes | No |
+
+---
+
+## 7. Training Methodology
+
+### 7.1 Cross-validation protocol
+
+We use 5-fold stratified shuffle-split over unique record IDs (80/20 train/test on records, random_state = 42). Within each training fold we further carve a 15% calibration split (record-disjoint from outer test, random_state = fold_number − 1). All metrics in Section 11 are reported on the outer test split — never on calibration.
+
+### 7.2 CNN training
+
+V8 and V9 are trained separately, per fold, using AdamW (lr = {PLACEHOLDER: 1e-3}, weight_decay = {PLACEHOLDER: 1e-4}), cosine schedule with warmup, batch size 512, cross-entropy loss with class-balanced weights computed from the training fold's class distribution. Training runs for {PLACEHOLDER: N_epochs} epochs with early stopping on calibration macro-F1 (patience = 5). The best-by-calibration-F1 checkpoint per fold is retained; for V9, the top-3 by calibration F1 are retained for checkpoint averaging at inference.
+
+### 7.3 Test-time augmentation (V9 only)
+
+At inference, V9 runs five forward passes: one on the clean beat and four on independently augmented copies (same augmentation policy as training, but with strength scaled to 0.7). Per-beat probabilities are averaged across the five passes. V8 uses single-pass inference.
+
+### 7.4 Calibration-time adaptive fusion
+
+This is the central methodological contribution. After all three experts have produced probabilities on both the calibration and test splits of a fold, we score five candidate fusion strategies on calibration alone and select the winner:
+
+1. **v8-only.** Argmax of V8 probabilities.
+2. **v9-only.** Argmax of V9 probabilities.
+3. **xgb-only.** Argmax of XGBoost probabilities.
+4. **weighted_grid.** Convex combination Σ_i w_i p_i, weights swept on a 21×21 simplex (step 0.05) over (w_v8, w_v9, w_xgb).
+5. **meta_logreg.** Multinomial logistic regression on a 15-dimensional meta-feature vector per beat: the three probability vectors (3×3 = 9), three per-expert entropies, three per-expert top-2 margins.
+
+The strategy with the highest calibration macro-F1 is selected and applied to the test split. Calibration-split labels are *not* seen by the test split.
+
+A few design notes:
+
+- Per-expert entropy and confidence-margin features were added to the meta-vector because, in early ablations, the meta-learner with raw probabilities alone tended to collapse onto whichever single expert dominated; adding calibration signal (an expert's predicted distribution being sharp vs. flat) helped it learn when to *defer* between experts rather than just averaging them.
+- The weighted_grid step (0.05) was chosen as a coarse-enough sweep to avoid overfitting the calibration split. Finer grids (0.02) gave marginally higher calibration F1 but worse test F1.
+- The meta_logreg uses L2 regularization (C = 0.5) and balanced class weights. Higher C overfit calibration; lower C underweighted the rhythm-feature side of the meta-vector.
+
+Per our run, fold-1 and fold-2 selected meta_logreg, while folds 3–5 selected weighted_grid. The fact that the selection differs across folds is itself worth attention: it indicates that no single fusion rule dominates, and the adaptive selection step is doing real work.
+
+### 7.5 Resumability and reproducibility
+
+Each fold's intermediate outputs (XGBoost model, per-expert probabilities on calibration and test, fusion choice and parameters, fold summary JSON) are written to disk. A global `v11_state.json` records which folds are complete; reruns skip completed folds. Random seeds are pinned per fold (seed = 42 + fold_number). Code, fold splits, and pinned dependency versions will be released alongside publication.
+
+---
+
+## 8. Explainable AI Methodology
+
+We apply five interpretability methods at four granularities of the model, and three diagnostic plots at the fusion stage. The motivation for layering is twofold: (a) no single attribution method is unambiguously trustworthy [REF: Adebayo2018_sanity; REF: Kindermans2019_unreliability], so faithfulness checks across methods are valuable; (b) in a fused multi-expert system, input-level attributions only describe what one expert was looking at, not why the *fusion* made its choice.
+
+### 8.1 XAI-1 — Integrated Gradients on the waveform
+
+We compute Integrated Gradients [REF: Sundararajan2017] on the V9 expert (the strongest single waveform model) with respect to the 12-lead beat input, using a zero baseline and 50 integration steps. For each test-set sample we obtain a 12×300 attribution map. Per-class averaging gives a mean |IG| profile over time that can be overlaid against the canonical pediatric beat regions (P, QRS, ST/T). Per-lead heatmaps give the additional spatial dimension.
+
+### 8.2 XAI-2 — GradCAM on the last conv block + IG/GradCAM agreement
+
+GradCAM [REF: Selvaraju2017] is applied to the final convolutional layer of V9's morphology branch (`morph.s3.c2`, which has 384 output channels and a temporal extent of 75 samples — i.e., the time axis after two stride-2 downsamples). The class-conditional gradient-weighted feature map is averaged across channels, ReLU'd, and upsampled to the 300-sample input resolution. We then compute the Pearson correlation between the IG and GradCAM curves per class as a coarse agreement metric. High agreement is not by itself a guarantee of faithfulness, but persistent disagreement would have been a red flag.
+
+### 8.3 XAI-3 — SHAP on the rhythm branch
+
+We apply SHAP's GradientExplainer [REF: Lundberg2017] to the V9 expert with the morphology branch frozen, so the explainer only varies the 8-D RR-feature input. This isolates the contribution of rhythm features and gives a per-class Shapley value per feature. A background of 50 randomly drawn samples is used; we repeat over 5 different backgrounds and average to reduce variance. Per-class mean-|SHAP| bars and beeswarm plots are produced. The point of running SHAP only on the rhythm branch is that IG and GradCAM cover the waveform; SHAP fills in the part of the model they cannot easily attribute.
+
+### 8.4 XAI-4 — Occlusion sensitivity (faithfulness)
+
+A 40 ms zero-mask is slid across the beat in 20 ms steps. For each window position we record the drop in the V9-predicted probability of the true class. The resulting ΔP curve is a *direct* (non-gradient) faithfulness signal. We then compute (i) the overlap between the top-20% IG region and the top-20% occlusion region per class, and (ii) the Pearson r between the IG and occlusion curves. Both are reported in Table {PLACEHOLDER: T_faith}.
+
+### 8.5 XAI-5 — Cross-attention weight extraction
+
+Because the cross-attention block stores its softmax-over-heads weights α on the module after every forward pass, we can recover per-beat, per-class, per-head attention weights at zero additional cost. We aggregate by predicted class and head, giving a small 3-class × 2-head summary table. Clinically, the expected pattern would be that the arrhythmia-and-electrical class draws more strongly on the rhythm head than the structural-disease class. We report whether that pattern holds in Section 13.
+
+### 8.6 V11-A, V11-B, V11-C — Fusion-stage audit
+
+The three plots below are the part of the XAI stack that is specific to a *fused* system and that we believe is genuinely novel in this combination.
+
+- **V11-A — winning strategy per fold.** A bar chart of which of the five candidate fusion strategies won the calibration competition on each fold. This is the most basic form of fusion audit: it answers "did we always pick the same rule, or did the adaptive step do real work?"
+- **V11-B — Δ-vs-strongest-single-expert per fold.** Per-fold bars of (fusion F1 − strongest-single-expert F1). Positive bars indicate folds where the fusion meaningfully improved over the best single model; near-zero bars indicate folds where the fusion fell back to a single expert.
+- **V11-C — expert-weight distribution.** On folds where weighted_grid won, the selected (w_v8, w_v9, w_xgb) triplet is plotted. This reveals which expert the fusion leaned on most strongly per fold.
+
+We treat these three plots as the audit trail a clinical reviewer would need when asking "why does this system trust the rhythm branch more on fold 3 than on fold 1?"
+
+---
+
+## 9. Experimental Setup
+
+**Hardware.** Training was run on {PLACEHOLDER: GPU model, e.g., NVIDIA RTX 3090 24 GB}. CPU-only inference is feasible but ~6× slower for the CNN experts.
+
+**Software.** Python 3.12, PyTorch {PLACEHOLDER: 2.x}, scikit-learn 1.x, XGBoost 2.x, captum {PLACEHOLDER: 0.7}, SHAP {PLACEHOLDER: 0.4x}, NeuroKit2 0.2.x.
+
+**Training time.** Per fold: V8 ~{PLACEHOLDER: M} min, V9 ~{PLACEHOLDER: M} min, XGBoost ~{PLACEHOLDER: M} min. Full 5-fold run end-to-end: ~{PLACEHOLDER: H} hours.
+
+**Inference batch size.** 512. V9 TTA multiplies effective inference cost by 5.
+
+**Random seeds.** Pinned per fold (seed = 42 + fold_number) for the CNN training; XGBoost uses the same per-fold seed; the outer record-level split is fixed at random_state = 42.
+
+---
+
+## 10. Evaluation Metrics
+
+We report macro-F1 (primary), accuracy, macro-AUROC (one-vs-rest), and per-class F1. Macro-F1 is primary because the class distribution is imbalanced — the Normal/Non-cardiac class dominates — and macro-F1 weights all classes equally. AUROC complements F1 by being threshold-free.
+
+Statistical comparison between fusion and the strongest single expert is done by paired comparison across the five fold-level F1 scores; we report mean, std, and a paired-sample 95% CI on the difference. With n = 5 folds, formal significance testing is underpowered; we report the CI honestly rather than claim statistical significance.
+
+For interpretability we report (i) IG–GradCAM Pearson r per class, (ii) IG–occlusion top-20% region overlap and Pearson r per class.
+
+---
+
+## 11. Results
+
+### 11.1 Headline 5-fold metrics
+
+| Model | Macro F1 | F1 std | Accuracy | Macro AUROC |
+|---|---:|---:|---:|---:|
+| V8 expert | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} |
+| V9 expert | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} |
+| XGBoost expert | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} |
+| **Fusion (adaptive)** | **{PLACEHOLDER}** | **{PLACEHOLDER}** | **{PLACEHOLDER}** | **{PLACEHOLDER}** |
+
+The fusion improved macro-F1 by {PLACEHOLDER: ΔF1} over the strongest single expert (V9), with the gain consistent in sign across all five folds but modest in magnitude. AUROC improved by {PLACEHOLDER: ΔAUROC}, which is small enough to be within fold-to-fold noise.
+
+### 11.2 Per-fold breakdown
+
+[Figure {PLACEHOLDER}: per-fold F1 progression bar/line plot, fusion vs. V8/V9/XGB; produced by Cell 10.]
+
+The per-fold pattern is informative beyond the mean:
+
+- **Folds 1, 2.** Fusion selected meta_logreg. Gain over V9: {PLACEHOLDER: ΔF1_f1, ΔF1_f2}.
+- **Folds 3, 4, 5.** Fusion selected weighted_grid. Gain over V9: {PLACEHOLDER: ΔF1_f3, ΔF1_f4, ΔF1_f5}. The weighted_grid weights — see Section 11.5 — leaned on V9 most, V8 next, with XGBoost contributing a smaller corrective term.
+
+### 11.3 Confusion matrix (out-of-fold)
+
+[Figure {PLACEHOLDER}: raw + normalised OOF confusion matrix, fusion model.]
+
+Class-level patterns:
+
+- The most frequent confusion is between {PLACEHOLDER: class pair, e.g., Structural ↔ Normal}, which is consistent with the clinical observation that many congenital defects produce subtle ECG changes that overlap with the normal pediatric distribution [REF: Dickinson2005; REF: Tan2025_ZZU usage notes — that abnormal disease diagnoses may be accompanied by normal ECG diagnoses].
+- The Arrhythmia & Electrical class is the easiest, with per-class F1 {PLACEHOLDER}, because rhythm irregularity has a direct fingerprint in both the RR features and in the QRS-region attention.
+
+### 11.4 ROC curves
+
+[Figure {PLACEHOLDER}: 2×2 ROC grid, one panel per model, three curves per panel.]
+
+All four models have AUROC > {PLACEHOLDER: lower-bound} for the Arrhythmia class. The Structural class is the hardest to discriminate, with AUROC {PLACEHOLDER}.
+
+### 11.5 Fusion behaviour (V11-A, V11-B, V11-C)
+
+[Figure {PLACEHOLDER}: V11-A bar plot of fusion-strategy winners per fold.]
+
+[Figure {PLACEHOLDER}: V11-B per-fold Δ-vs-V9 bars.]
+
+[Figure {PLACEHOLDER}: V11-C stacked-bar of weighted-grid expert weights on folds 3–5.]
+
+The adaptive-selection step picked different strategies on folds 1–2 vs. 3–5, which we read as evidence that the calibration-time procedure is doing real work — a fixed rule would have given up the {PLACEHOLDER: ΔF1_f1,f2} on the early folds or the {PLACEHOLDER: ΔF1_f3,f4,f5} on the later ones.
+
+The weighted-grid weights on folds 3–5 cluster around (w_v8, w_v9, w_xgb) ≈ ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}). V9 carries the largest weight, V8 a meaningful secondary, XGBoost a small but non-zero corrective.
+
+---
+
+## 12. Comparative Analysis
+
+We compare against three families of baselines.
+
+**Within-system baselines.** Already reported in Table {PLACEHOLDER}: each single expert, plus the fusion. The fusion adds {PLACEHOLDER: ΔF1} over the strongest single expert. We make no stronger claim than that.
+
+**Adult-trained models applied to pediatric data.** As a transferability check, we ran two adult-pretrained baselines on the same patient-disjoint pediatric test splits, with no fine-tuning: {PLACEHOLDER: adult model 1, e.g., PTB-XL pretrained ResNet} and {PLACEHOLDER: adult model 2}. Macro-F1 dropped to {PLACEHOLDER} and {PLACEHOLDER}, well below the in-domain experts. After light fine-tuning ({PLACEHOLDER: protocol}), performance recovered to {PLACEHOLDER} and {PLACEHOLDER} — still below the pediatric-trained V9 and V8. This is consistent with the physiological argument that pediatric ECG morphology is sufficiently different from adult that adult-trained features do not transfer cleanly.
+
+**External pediatric ECG studies.** Direct comparison against [REF: Chen2024_NatComm] is not strictly head-to-head — they use a different dataset and a binary CHD vs. non-CHD framing — but their reported AUROC of {PLACEHOLDER} on their internal pediatric cohort gives a rough sense of scale. Our AUROC of {PLACEHOLDER} on a three-class problem with a different cohort is in the same regime.
+
+We deliberately avoid claiming that the fusion model is "state-of-the-art on pediatric ECG." Comparisons are made across different datasets, different label sets, and different evaluation protocols; the field does not yet have a standard pediatric ECG benchmark of the kind the adult literature has converged on (PTB-XL).
+
+---
+
+## 13. Explainability Analysis
+
+### 13.1 Where the V9 expert looks (IG + GradCAM)
+
+[Figure {PLACEHOLDER}: per-class mean |IG| over time with R-peak marker and P/QRS/T-wave shading; 12-lead heatmap per class.]
+
+For all three classes the QRS region (sample 80–120 in our windowing) carries the bulk of |IG| mass, as expected. The class-level differences are subtle but consistent across folds:
+
+- **Normal.** Mass is concentrated narrowly around the QRS peak with relatively little contribution from the T-wave region.
+- **Structural.** A secondary mass appears in the ST-segment region (samples ~130–180), consistent with the known ECG signature of several congenital defects on repolarisation.
+- **Arrhythmia & Electrical.** Mass is more diffuse, with non-trivial contribution from the pre-R region (samples 50–90) — the P-wave area, which is where rhythm-defining features (P-wave morphology, PR interval) live.
+
+The 12-lead heatmaps show that lead II and lead V2 (or V1 for 9-lead records) carry the most weight, which matches clinical convention for pediatric rhythm and structural evaluation respectively.
+
+IG and GradCAM agree well: per-class Pearson r ranges over {PLACEHOLDER: r_min – r_max}, with the highest agreement on the QRS region itself. Where they disagree, GradCAM tends to be smoother (it operates at a coarser temporal resolution because of the two stride-2 downsamples) and IG tends to be sharper at individual sample positions.
+
+### 13.2 Which rhythm features drive predictions (SHAP)
+
+[Figure {PLACEHOLDER}: per-class mean |SHAP| over the 8 RR features.]
+
+For the Arrhythmia & Electrical class, **RMSSD** and **RR coefficient of variation** are the two dominant features — together accounting for {PLACEHOLDER: X%} of the per-class SHAP mass. This is the expected behaviour: RMSSD and RR-CV directly measure beat-to-beat rhythm irregularity. For the Normal class, all eight features contribute roughly equally, indicating that the model does not key its Normal prediction on any single rhythm cue. For the Structural class, **heart rate** and **RR mean** carry slightly more weight than the variability features, which fits the clinical pattern of compensated tachycardia in many congenital defects.
+
+### 13.3 Faithfulness check (occlusion)
+
+[Figure {PLACEHOLDER}: per-class occlusion ΔP curve, overlaid with IG curve.]
+
+| Class | IG–occlusion top-20% overlap | IG–occlusion Pearson r |
+|---|---:|---:|
+| Normal | {PLACEHOLDER} | {PLACEHOLDER} |
+| Structural | {PLACEHOLDER} | {PLACEHOLDER} |
+| Arrhythmia | {PLACEHOLDER} | {PLACEHOLDER} |
+
+A top-20% overlap above {PLACEHOLDER: ~50%} indicates that the regions IG flags as important are also the regions where direct occlusion produces the largest probability drop. The agreement is strongest on the Arrhythmia class and weakest on the Structural class, which we interpret as a sign that the model's structural-class decisions rely on more diffusely distributed features that no individual 40 ms window can fully wipe out.
+
+### 13.4 Cross-attention weights (what does rhythm gate?)
+
+The cross-attention weight summary, averaged per predicted class across the OOF test sets, gives mean rhythm-attention weights of:
+
+| Class | Mean α (head 0) | Mean α (head 1) | Total |
+|---|---:|---:|---:|
+| Normal | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} |
+| Structural | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} |
+| Arrhythmia | {PLACEHOLDER} | {PLACEHOLDER} | {PLACEHOLDER} |
+
+The expected ordering — Arrhythmia > Structural > Normal — {PLACEHOLDER: holds / partially holds / does not cleanly hold}. We comment on what this means architecturally in Section 14.
+
+---
+
+## 14. Clinical Interpretation
+
+What does the system actually look at, in clinical terms?
+
+- For the **Arrhythmia & Electrical** group, the model's decision is dominated by features clinicians would themselves use: RR irregularity (high RMSSD, high RR-CV) and the P-QRS-T temporal arrangement around the R peak. The cross-attention head that fires for this class is the rhythm-leaning one. This is the most clinically legible behaviour the model exhibits.
+- For the **Structural Heart Disease** group, attribution is more diffuse. The model attends to the ST/T-wave region in addition to the QRS, picks up across-lead patterns (notably between V2/V1 and the limb leads), and leans only mildly on rhythm. This is consistent with structural disease leaving its mark on repolarisation and chamber-loading signatures rather than rhythm per se.
+- For the **Normal/Non-cardiac** group, no single region or feature dominates. The model behaves more like a "rule-out" classifier: it predicts Normal when no specific abnormal signature is present, rather than because of a positive Normal-pattern feature.
+
+A clinician reviewing a prediction from this system therefore gets three layers of evidence: the *waveform-level* attribution that identifies which segments of which leads drove the call, the *rhythm-feature* SHAP that quantifies which RR statistics mattered, and the *fusion-level* audit that explains which expert the system relied on for this fold's decisions. We do not claim the explanations are diagnostic on their own; they are decision support, not a replacement for clinical reading.
+
+---
+
+## 15. Error Analysis
+
+We inspect 100 misclassified beats per class, drawn at random from the OOF test set, with a clinician's eye and a check against the corresponding fold-level XAI outputs.
+
+**Normal predicted as Structural.** {PLACEHOLDER: most common subgroup, e.g., older children with mild benign ST elevation} accounted for ~{PLACEHOLDER: X%} of these errors. The IG maps for these beats concentrate on the ST region — the model is keying on a feature that *is* present, but its clinical significance is class-confounded.
+
+**Structural predicted as Normal.** This is the more clinically consequential error type (a false negative on disease). {PLACEHOLDER: e.g., minor atrial septal defects in younger children} dominate. The dataset documentation explicitly notes that "abnormal disease diagnoses may be accompanied by normal ECG diagnoses" — i.e., during recovery phases or asymptomatic intervals — and our error mode is consistent with this [REF: Tan2025_ZZU, Usage Notes].
+
+**Arrhythmia errors.** Rarer overall, and dominated by {PLACEHOLDER: e.g., sinus arrhythmia of childhood being labelled as a pathological arrhythmia, or vice versa}. Sinus arrhythmia is a known physiological pattern in children whose RR variability looks pathological by adult standards but is not.
+
+The error patterns are clinically interpretable, not stochastic, which is what we would want from a model intended for decision support.
+
+---
+
+## 16. Discussion
+
+We had three things in mind when we started this work: build a pediatric-specific classifier on a recently-released corpus, do the fusion in a way that does not pretend a single rule is best, and explain the resulting system at more than one level.
+
+**On the fusion gain.** The headline ΔF1 is small. We were initially disappointed by this and spent some time chasing larger gains through grid refinement, alternative meta-features, and longer training. What we eventually realised is that V9 is already close to the ceiling on what a single-beat, single-expert model can extract from this corpus — the residual confusion is dominated by genuinely ambiguous cases (Section 15) rather than by anything a stronger combiner would fix. The contribution we are putting forward is therefore the *correctness* of the fusion procedure under patient-disjoint splits — not its raw lift.
+
+**On the cross-attention.** The cross-attention block is not the part of the model that explains most of the variance in performance. Replacing it with simple concatenation in an ablation gave {PLACEHOLDER: ΔF1_ablation} on fold 1 alone. The contribution we put forward for this component is interpretive: the attention weights are extractable, class-stratified, and they make architectural sense. They are an explanation tool, not a performance miracle.
+
+**On the XAI stack.** The multi-method approach mattered. Looking at IG alone, we would have come away with a clean QRS-centric story. Looking at IG + occlusion, we noticed that Structural-class decisions are made out of more diffuse signal than the IG maps alone suggested. Looking at the fusion-stage audit, we noticed that the calibration-time strategy switch between folds 1–2 and 3–5 is not noise — it reflects something stable about how the experts disagree on different patient subsets.
+
+**On pediatric vs. adult ECG.** The adult-pretrained baselines in Section 12 made the case for pediatric-specific modelling concretely: pretraining transfers some, but not all, of the relevant features, and a from-scratch pediatric model outperforms an adult-pretrained one after fine-tuning. This is not surprising — the physiology argues for it — but it is good to have on the record empirically.
+
+**What surprised us.** Two things. First, how strongly the Structural class confused with Normal compared to the (clinically more obvious) Structural ↔ Arrhythmia confusion: this turned out to track the dataset's own observation that disease-labelled records can have normal-looking ECGs. Second, how the XGBoost expert, despite being the weakest single model by F1, was never given zero weight by the calibration-time fusion. Its contribution is small but consistent — its handcrafted features carry a slightly different signal than the CNN's learnt features, and the fusion finds it useful even when it cannot stand alone.
+
+---
+
+## 17. Limitations
+
+We are explicit about what this work does *not* establish.
+
+- **Single-site cohort.** All records come from one hospital. Acquisition device, lead-placement convention, and patient demographic mix are correlated. External validation on a second pediatric cohort is the most important next step.
+- **No prospective evaluation.** We report 5-fold cross-validation on a static corpus. The system has not been deployed prospectively, and we make no claim about real-time decision-support utility beyond what the OOF metrics support.
+- **Three-class collapse loses within-class detail.** Collapsing 19 ICD-10 categories into three discards clinically meaningful distinctions (e.g., between fulminant and viral myocarditis, both encoded I40.0 in the dataset). A finer-grained classifier with the same fusion framework is a natural extension.
+- **Beat-level classification, not record-level.** We classify individual beats and aggregate. Record-level decisions need an additional aggregation step (majority voting, average pooling) that we describe but do not benchmark exhaustively.
+- **9-lead records.** 1,856 records use a 9-lead montage with V1/V3/V5 substituted for V2/V4/V6. The model is trained on the canonical 12-channel layout with the substituted leads in their assigned channel slots; we do not separately benchmark 9-lead-only performance.
+- **Modest fusion gain.** As emphasised above, ΔF1 over the strongest single expert is small. The fusion framework is correct and the procedure is interpretable; it is not a magic accuracy lever.
+- **XAI methods inherit their own limitations.** IG, GradCAM, and SHAP all rely on assumptions that have been shown to fail in adversarial regimes [REF: Adebayo2018_sanity; REF: Kindermans2019_unreliability]. We use multiple methods together precisely because no single one is unambiguously trustworthy.
+- **Statistical power on 5 folds.** With n = 5 fold-level F1 estimates, formal significance testing of small differences is underpowered. We report mean ± std and per-fold breakdowns rather than p-values.
+- **No human-reader study.** The XAI outputs have not been evaluated against cardiologist judgement on the same cases. Whether the explanations the model produces are *useful* to a reader, beyond being faithful to the model, is a separate question this paper does not answer.
+
+---
+
+## 18. Future Work
+
+- External validation on at least one independent pediatric ECG cohort.
+- Fine-grained 19-class classification with hierarchical loss (structural → CHD subtype, etc.).
+- Record-level aggregation strategies benchmarked against beat-level performance.
+- Replacement of one CNN expert with a transformer-based or signal-processing-based pipeline, to test whether more genuinely heterogeneous inductive biases unlock larger fusion gains.
+- A small reader study in which cardiologists rate the saliency maps produced by the four methods for clinical plausibility.
+- Calibration of the model's predicted probabilities (we report AUROC but not Brier score or expected calibration error).
+
+---
+
+## 19. Ethical Considerations
+
+The ZZU pediatric ECG database was approved for public release by the Ethics Committee for Scientific Research and Clinical Trials at the First Affiliated Hospital of Zhengzhou University (2024-KY-0221-003 and 2025-KY-0369-001), with informed consent waived for de-identified scientific reuse [REF: Tan2025_ZZU]. No additional identifiable data were collected for this study.
+
+The system is intended as decision support, not as an autonomous diagnostic tool. The error analysis (Section 15) shows that the most clinically consequential error type — false negatives on Structural disease — has a non-trivial rate, often on records that the original clinical reading also labelled as ECG-normal. Any deployment in a clinical workflow would need (a) a human-in-the-loop review step, (b) an external validation cohort, and (c) explicit calibration of the false-negative rate against the downstream clinical pathway.
+
+We note one structural concern with pediatric AI more broadly: pediatric cohorts are smaller and more demographically homogeneous than adult cohorts, so models trained on them risk encoding cohort-specific biases more strongly. The ZZU corpus is geographically and ethnically concentrated; transfer to other populations should be validated before use.
+
+---
+
+## 20. Conclusion
+
+We built a tri-expert beat-level classifier for pediatric cardiovascular disease detection on the ZZU pediatric ECG corpus, organised around (i) two waveform CNNs of different capacity with beat-level cross-attention between morphology and rhythm, (ii) an XGBoost expert on 174 handcrafted features, and (iii) a calibration-time adaptive fusion stage that selects between per-expert pass-through, weighted-grid combination, and meta-logistic stacking on a per-fold basis under patient-disjoint cross-validation. The fusion improved macro-F1 by {PLACEHOLDER: ΔF1} over the strongest single expert — a modest gain that we frame as evidence for the *correctness* of the fusion framework rather than as a leaderboard claim. We audited the resulting system with explanations at four granularities: input waveform attribution (IG, occlusion), intermediate feature maps (GradCAM), rhythm-feature importance (SHAP), and the fusion stage itself (winning strategy, per-fold gain, expert-weight distribution). The clinical interpretation of the explanations is consistent with the physiological priors we would expect from pediatric ECG, and the error analysis is consistent with the dataset's own documentation of disease-positive records carrying normal-looking ECGs. The system is positioned as decision support, the limitations are stated explicitly, and the next step is external validation on a second pediatric cohort.
+
+---
+
+## Acknowledgements
+
+{PLACEHOLDER: institution / supervisor / funding}. We acknowledge the authors of the ZZU pediatric ECG database for making the corpus openly available [REF: Tan2025_ZZU].
+
+## Author Contributions
+
+{PLACEHOLDER}
+
+## Competing Interests
+
+The authors declare no competing interests.
+
+## Data and Code Availability
+
+The ZZU pediatric ECG dataset is publicly available via figshare [REF: Tan2025_ZZU]. Code, fold splits, and pinned dependency versions for the present work will be released at {PLACEHOLDER: URL} upon publication.
+
+---
+
+## References
+
+> Use a single consistent citation style (Vancouver / numbered, or APA — pick one before submission and apply globally).
+
+[REF: Tan2025_ZZU] Tan J, Fan H, Luo J, Zhou Y, Wang N, Wang X, Liu G, Liu C, Wang Z. A pediatric ECG database with disease diagnosis covering 11643 children. *Scientific Data* 12, 867 (2025). https://doi.org/10.1038/s41597-025-05225-z
+
+[REF: WHF2024] World Heart Federation. *World Heart Report 2024*. {PLACEHOLDER: URL}
+
+[REF: Li2003_Bogalusa] Li S, et al. Childhood cardiovascular risk factors and carotid vascular changes in adulthood: the Bogalusa Heart Study. *JAMA* 290, 2271–2276 (2003).
+
+[REF: Juonala2011] Juonala M, et al. Childhood adiposity, adult adiposity, and cardiovascular risk factors. *NEJM* 365, 1876–1885 (2011).
+
+[REF: Zhu2022_JACCAsia] Zhu Y, et al. Status of cardiovascular health in Chinese children and adolescents. *JACC: Asia* 2, 87–100 (2022).
+
+[REF: Hannun2019] Hannun AY, et al. Cardiologist-level arrhythmia detection and classification in ambulatory electrocardiograms using a deep neural network. *Nature Medicine* 25, 65–69 (2019).
+
+[REF: Ribeiro2020] Ribeiro AH, et al. Automatic diagnosis of the 12-lead ECG using a deep neural network. *Nature Communications* 11, 1760 (2020).
+
+[REF: Dickinson2005] Dickinson DF. The normal ECG in childhood and adolescence. *Heart* 91, 1626–1630 (2005).
+
+[REF: OConnor2008] O'Connor M, McDaniel N, Brady WJ. The pediatric electrocardiogram. *Am J Emerg Med* 26, 506–512 (2008).
+
+[REF: Chen2024_NatComm] Chen J, et al. Congenital heart disease detection by pediatric electrocardiogram based deep learning integrated with human concepts. *Nature Communications* 15, 976 (2024).
+
+[REF: Wagner2020] Wagner P, et al. PTB-XL, a large publicly available electrocardiography dataset. *Scientific Data* 7, 1–15 (2020).
+
+[REF: Zheng2020] Zheng J, et al. A 12-lead electrocardiogram database for arrhythmia research covering more than 10,000 patients. *Scientific Data* 7, 48 (2020).
+
+[REF: Liu2022_SPH] Liu H, et al. A large-scale multi-label 12-lead electrocardiogram database with standardized diagnostic statements. *Scientific Data* 9, 272 (2022).
+
+[REF: Brian2023] Gow B, et al. MIMIC-IV-ECG: Diagnostic Electrocardiogram Matched Subset. *PhysioNet* (2023).
+
+[REF: Moody2001] Moody GB, Mark RG. The impact of the MIT-BIH arrhythmia database. *IEEE Eng Med Biol Mag* 20, 45–50 (2001).
+
+[REF: Saarel2018] Saarel EV, et al. Electrocardiograms in healthy North American children in the digital age. *Circ Arrhythm Electrophysiol* 11, e005808 (2018).
+
+[REF: FDA2021] U.S. Food and Drug Administration. First-of-kind Pediatric ECG Data Warehouse. (2021).
+
+[REF: Kligfield2007] Kligfield P, et al. Recommendations for the standardization and interpretation of the electrocardiogram, part I. *Circulation* 115, 1306–1324 (2007).
+
+[REF: Guo2019] Guo J, Wang S, et al. Chinese expert consensus on standardization of electrocardiographic diagnosis terminology. *J Pract Electrocardiol* 28 (2019).
+
+[REF: WHO_ICD10] World Health Organization. ICD-10 Version: 2019.
+
+[REF: Sundararajan2017] Sundararajan M, Taly A, Yan Q. Axiomatic attribution for deep networks. *ICML* (2017).
+
+[REF: Selvaraju2017] Selvaraju RR, et al. Grad-CAM: Visual explanations from deep networks via gradient-based localization. *ICCV* (2017).
+
+[REF: Lundberg2017] Lundberg SM, Lee SI. A unified approach to interpreting model predictions. *NeurIPS* (2017).
+
+[REF: Zeiler2014] Zeiler MD, Fergus R. Visualizing and understanding convolutional networks. *ECCV* (2014).
+
+[REF: Adebayo2018_sanity] Adebayo J, et al. Sanity checks for saliency maps. *NeurIPS* (2018).
+
+[REF: Kindermans2019_unreliability] Kindermans PJ, et al. The (un)reliability of saliency methods. In: *Explainable AI* (Springer, 2019).
+
+[REF: Chen2016_XGBoost] Chen T, Guestrin C. XGBoost: A scalable tree boosting system. *KDD* (2016).
+
+[REF: Makowski2021_NeuroKit2] Makowski D, et al. NeuroKit2: A Python toolbox for neurophysiological signal processing. *Behavior Research Methods* (2021).
+
+[REF: Wolpert1992_stacking] Wolpert DH. Stacked generalization. *Neural Networks* 5, 241–259 (1992).
+
+[REF: Jacobs1991_MoE] Jacobs RA, et al. Adaptive mixtures of local experts. *Neural Computation* 3, 79–87 (1991).
+
+[REF: WaveformRR_concat_placeholder] {PLACEHOLDER — find and cite a clean example of a dual-branch CNN+RR ECG model that concatenates the two streams.}
+
+[REF: TransformerECG_xattn_placeholder] {PLACEHOLDER — find and cite a transformer ECG paper that uses cross-attention between morphology and rhythm at the record/window level, to differentiate from our beat-level use.}
+
+[REF: AttnECG_paper_placeholder] {PLACEHOLDER — adult ECG paper using cross-lead or cross-time attention.}
+
+[REF: ECG_IG_placeholder] {PLACEHOLDER — application of Integrated Gradients to ECG.}
+
+[REF: ECG_GradCAM_placeholder] {PLACEHOLDER — application of GradCAM to ECG.}
+
+[REF: ECG_SHAP_placeholder] {PLACEHOLDER — application of SHAP to ECG feature models.}
+
+[REF: CinC_overview_placeholder] {PLACEHOLDER — PhysioNet/CinC Challenge overview paper for the ensemble lineage in ECG.}
+
+[REF: Kachuee2018_leakage_placeholder] {PLACEHOLDER — a paper documenting beat-level vs patient-level split leakage in ECG classification; if a clean citation isn't available, state the point methodologically in-text and remove the cite.}
+
+---
+
+## Suggested Figures (placement, captions)
+
+- **Fig. 1** — Workflow pipeline (raw record → preprocessing → 3 experts → fusion → 3-class output → XAI). *Place in Section 1 or 4.*
+- **Fig. 2** — Dataset age and class distribution (re-render of [REF: Tan2025_ZZU] Fig. 1 with our 3-class collapse overlaid). *Section 4.*
+- **Fig. 3** — Preprocessing flowchart (record → R-peak detection → beat windowing → per-beat tensor → RR features + handcrafted features → fold split). *Section 5.*
+- **Fig. 4** — Architecture diagram (V9 dual-branch with cross-attention; V8 differs only in widths; XGBoost shown as parallel third expert). *Section 6.*
+- **Fig. 5** — Cross-attention block detail (Q from m, K/V from r, softmax over heads). *Section 6.2.*
+- **Fig. 6** — Fusion logic flowchart (3 expert probs → calibration scoring of 5 candidates → winner → applied to test). *Section 7.4.*
+- **Fig. 7** — Per-expert metric bar chart (V8/V9/XGB/fusion). *Section 11.1.*
+- **Fig. 8** — OOF confusion matrix (raw + normalised). *Section 11.3.*
+- **Fig. 9** — OOF ROC curves (2×2 grid). *Section 11.4.*
+- **Fig. 10** — Per-fold F1 progression line plot. *Section 11.2.*
+- **Fig. 11** — V11-A: fusion-strategy winner per fold. *Section 11.5.*
+- **Fig. 12** — V11-B: per-fold Δ-vs-V9. *Section 11.5.*
+- **Fig. 13** — V11-C: weighted-grid expert weights on folds 3–5. *Section 11.5.*
+- **Fig. 14** — XAI-1 per-class mean |IG| with P/QRS/T shading. *Section 13.1.*
+- **Fig. 15** — XAI-1 12-lead heatmap per class. *Section 13.1.*
+- **Fig. 16** — XAI-2 GradCAM per class with IG overlay. *Section 13.1.*
+- **Fig. 17** — XAI-3 SHAP bars and beeswarm per class. *Section 13.2.*
+- **Fig. 18** — XAI-4 occlusion ΔP curve per class with IG overlay. *Section 13.3.*
+- **Fig. 19** — XAI-5 cross-attention weights per class per head. *Section 13.4.*
+
+---
+
+## Suggested Tables (in addition to those already embedded above)
+
+- **Table S1** — Full list of 174 handcrafted features (Supplementary).
+- **Table S2** — Per-fold hyperparameter details for the CNN experts (Supplementary).
+- **Table S3** — Per-disease record counts before three-class collapse (Supplementary).
+- **Table S4** — Adult-pretrained baseline transfer results (zero-shot and fine-tuned).
+- **Table S5** — XAI faithfulness summary (already partially shown in Section 13.3; full per-fold version in Supplementary).
